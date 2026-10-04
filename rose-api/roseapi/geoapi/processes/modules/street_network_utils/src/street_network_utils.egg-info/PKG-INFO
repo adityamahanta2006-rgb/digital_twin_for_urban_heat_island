@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: street_network_utils
+Version: 1.0
+Summary: Tools for street network management
+Author-email: Juan Pablo Duque <juanpablo.duque@polimi.it>
+Requires-Python: >=3.8

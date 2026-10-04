@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "street_network_utils"
+version = "1.0"
+description = "Tools for street network management"
+authors = [{ name="Juan Pablo Duque", email="juanpablo.duque@polimi.it" }]
+requires-python = ">=3.8"
+
+[tool.setuptools]
+package-dir = {"" = "src"}

@@ -1,0 +1,82 @@
+image: node:lts-alpine
+before_script:
+    - cp config.ts.sample config.ts
+    - cp styles.ts.sample styles.ts
+    - apk update
+    - apk add git
+    - npm install --force
+
+stages:
+    - build
+    - publish
+
+variables:
+    version_stable_release: '/^v([0-9]+)\.([0-9]+)\.([0-9]+)$/'
+    version_pre_release: '/^v[0-9]+\.[0-9]+\.[0-9]+\-(alpha|beta|rc)\.[0-9]+$/'
+
+# Run pipelines on MR, tags and push on 'main'
+workflow:
+    rules:
+        - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+        - if: ($CI_PIPELINE_SOURCE == "push" || $CI_PIPELINE_SOURCE == "web") && $CI_COMMIT_TAG
+        - if: ($CI_PIPELINE_SOURCE == "push" || $CI_PIPELINE_SOURCE == "web") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+lint:
+    stage: build
+    script:
+        - npm run lint
+
+test:
+    stage: build
+    script:
+        - npm run test
+
+build:
+    stage: build
+    script:
+        - npm run build
+
+pages:
+    stage: publish
+    rules:
+        - if: ($CI_PIPELINE_SOURCE == "push" || $CI_PIPELINE_SOURCE == "web") && $CI_COMMIT_TAG && $CI_COMMIT_TAG =~ $version_stable_release
+          variables:
+              ENVIRONMENT_NAME: $CI_COMMIT_TAG
+        - if: ($CI_PIPELINE_SOURCE == "push" || $CI_PIPELINE_SOURCE == "web") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+          variables:
+              ENVIRONMENT_NAME: $CI_COMMIT_BRANCH
+    variables:
+        DEPLOY_URL: https://piero.giro3d.org
+        OUTPUT: ./dist
+    environment:
+        name: pages/$ENVIRONMENT_NAME
+        action: start
+        url: $DEPLOY_URL
+    artifacts:
+        paths:
+            - dist
+        name: $ENVIRONMENT_NAME
+    publish: dist
+    script:
+        - npm run build -- --out-dir $OUTPUT --base $DEPLOY_URL
+
+publish_prerelease_package:
+    stage: publish
+    interruptible: false
+    retry: 1
+    script:
+        - channel="$(echo "$CI_COMMIT_TAG" | sed -E 's/^v[0-9]+\.[0-9]+\.[0-9]+-([[:alnum:]]+)\.[0-9]+$/\1/')"
+        - npm config set -- '//registry.npmjs.org/:_authToken' "${NPM_AUTH_TOKEN}"
+        - npm publish packages/piero/ --access public --tag ${channel}
+    rules:
+        - if: '$CI_COMMIT_TAG && $CI_COMMIT_TAG =~ $version_pre_release'
+
+publish_package:
+    stage: publish
+    interruptible: false
+    retry: 1
+    script:
+        - npm config set -- '//registry.npmjs.org/:_authToken' "${NPM_AUTH_TOKEN}"
+        - npm publish packages/piero/ --access public
+    rules:
+        - if: '$CI_COMMIT_TAG && $CI_COMMIT_TAG =~ $version_stable_release'

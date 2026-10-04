@@ -1,0 +1,438 @@
+import type Instance from '@giro3d/giro3d/core/Instance';
+import type Entity3D from '@giro3d/giro3d/entities/Entity3D';
+import type Giro3DMap from '@giro3d/giro3d/entities/Map';
+
+import Extent from '@giro3d/giro3d/core/geographic/Extent';
+import MaskLayer, { MaskMode } from '@giro3d/giro3d/core/layer/MaskLayer';
+import AxisGrid from '@giro3d/giro3d/entities/AxisGrid';
+import { isMap } from '@giro3d/giro3d/entities/Map';
+import Giro3dVectorSource from '@giro3d/giro3d/sources/VectorSource';
+import Feature from 'ol/Feature';
+import Polygon from 'ol/geom/Polygon';
+import { Fill, Stroke, Style } from 'ol/style';
+import { Color, Vector3 } from 'three';
+
+import type { DatasetAsLayerConfig, DatasetAsMeshConfig } from '@/types/configuration/datasets';
+import { Dataset, DatasetBase } from '@/types/Dataset';
+
+
+import { getConfig } from '@/config-loader';
+import { GLOBAL_EVENT_DISPATCHER } from '@/events';
+import EntityBuilder from '@/giro3d/EntityBuilder';
+import LayerBuilder from '@/giro3d/LayerBuilder';
+import loader from '@/loaders/loader';
+import { useDatasetStore } from '@/stores/datasets';
+import { useNotificationStore } from '@/stores/notifications';
+import { Datagroup, type DatasetLayer, type DatasetOrGroup } from '@/types/Dataset';
+import Notification from '@/types/Notification';
+import { isObject } from '@/utils/Types';
+import GeoJSON from "ol/format/GeoJSON.js";
+
+import type LayerManager from './LayerManager';
+import VectorSource from '@giro3d/giro3d/sources/VectorSource';
+import ColorLayer from '@giro3d/giro3d/core/layer/ColorLayer';
+import { getUid } from 'ol';
+
+const datasetSupportsOverlay = (obj: Dataset): obj is Dataset & DatasetBase<DatasetAsLayerConfig> =>
+    isObject(obj) &&
+    (obj.type === 'colorLayer' || obj.type === 'maskLayer' || obj.type === 'elevationLayer');
+
+const datasetSupportsMeshes = (obj: Dataset): obj is Dataset & DatasetBase<DatasetAsMeshConfig> =>
+    isObject(obj) && !datasetSupportsOverlay(obj);
+
+export default class DatasetManager {
+    private readonly _axisGrids: Map<string, AxisGrid> = new Map();
+    private readonly _entities: Map<string, Entity3D> = new Map();
+    private readonly _instance: Instance;
+    private readonly _layerManager: LayerManager;
+    private readonly _masks: Map<string, MaskLayer> = new Map();
+    private readonly _notifications = useNotificationStore();
+    private readonly _overlays: Map<string, DatasetLayer> = new Map();
+    private readonly _store = useDatasetStore();
+
+    public constructor(instance: Instance, layerManager: LayerManager) {
+        this._instance = instance;
+        this._layerManager = layerManager;
+
+        this._store.$onAction(({ after, args, name }) => {
+            after(() => {
+                switch (name) {
+                    case 'importFromFile':
+                        void this.importFromFile(args[0]);
+                        break;
+                    case 'addResult':
+                        this.importFromObject(args[0], args[1]);
+                        break;
+                    case 'remove':
+                        this.deleteDataset(args[0]);
+                        break;
+                    case 'setVisible':
+                        void this.onVisibilityChanged(args[0], args[1]);
+                        break;
+                    case 'toggleGrid':
+                        void this.onToggleGrid(args[0]);
+                        break;
+                    case 'toggleMask':
+                        void this.onToggleMask(args[0]);
+                        break;
+                }
+            });
+        });
+
+        for (const dataset of this._store.getDatasets()) {
+            if (dataset.visible) {
+                void this.preloadDataset(dataset);
+            }
+        }
+    }
+
+    public dispose(): void {
+        // Nothing to do (?)
+    }
+
+    private async createGrid(dataset: DatasetOrGroup): Promise<void> {
+        const box = this._store.getBoundingBox(dataset);
+        if (box == null || box.isEmpty()) {
+            return;
+        }
+
+        const grid = new AxisGrid({
+            style: {
+                color: new Color('orange'),
+                fontSize: 12,
+                numberFormat: Intl.NumberFormat('fr'),
+            },
+            ticks: {
+                x: 50,
+                y: 50,
+                z: 50,
+            },
+            volume: {
+                ceiling: box.max.z + 10,
+                extent: Extent.fromBox3(this._instance.referenceCrs, box).withMargin(20, 20),
+                floor: box.min.z - 10,
+            },
+        });
+        grid.name = `AxisGrid-${dataset.uuid}`;
+        await this._instance.add(grid);
+        this._axisGrids.set(dataset.uuid, grid);
+    }
+
+    private async createMask(dataset: DatasetOrGroup): Promise<void> {
+        // TODO: this assumes the dataset covers the whole bounding box
+        // (in particular, that it is oriented the same way)
+        // which will most likely not be the case...
+        const box = this._store.getBoundingBox(dataset);
+        if (box == null || box.isEmpty()) {
+            return;
+        }
+
+        // Contract bounding box so it makes stitching a bit nicer
+        box.expandByVector(new Vector3(-5, -5, 0));
+
+        const feature = new Feature({
+            geometry: new Polygon([
+                [
+                    [box.min.x, box.min.y],
+                    [box.min.x, box.max.y],
+                    [box.max.x, box.max.y],
+                    [box.max.x, box.min.y],
+                    [box.min.x, box.min.y],
+                ],
+            ]),
+            name: 'Mask polygon',
+        });
+
+        const mask = new MaskLayer({
+            name: `mask-${dataset.uuid}`,
+            source: new Giro3dVectorSource({
+                data: [feature],
+                style: new Style({
+                    fill: new Fill({ color: 'white' }),
+                }),
+            }),
+        });
+        mask.maskMode = MaskMode.Inverted;
+
+        // Apply the mask to the map
+        const maps = this._instance.getObjects(obj => isMap(obj)) as Giro3DMap[];
+        for (const map of maps) {
+            await map.addLayer(mask);
+            this._instance.notifyChange(map);
+        }
+        this._masks.set(dataset.uuid, mask);
+    }
+
+    private deleteDataset(dataset: DatasetOrGroup): void {
+        this.deleteGrid(dataset);
+        this.deleteMask(dataset);
+
+        const entity = this._entities.get(dataset.uuid);
+        if (entity) {
+            this._instance.remove(entity);
+            this._instance.notifyChange();
+        }
+
+        const layer = this._overlays.get(dataset.uuid);
+        if (layer) {
+            this._layerManager.removeBasemapLayer(layer);
+        }
+
+        GLOBAL_EVENT_DISPATCHER.dispatchEvent({ type: 'dataset-removed', value: dataset });
+    }
+
+    private deleteGrid(dataset: DatasetOrGroup): void {
+        const grid = this._axisGrids.get(dataset.uuid);
+        if (grid) {
+            this._instance.remove(grid);
+        }
+        this._axisGrids.delete(dataset.uuid);
+    }
+
+    private deleteMask(dataset: DatasetOrGroup): void {
+        const mask = this._masks.get(dataset.uuid);
+        if (mask) {
+            const maps = this._instance.getObjects(obj => isMap(obj)) as Giro3DMap[];
+            maps.forEach(map => {
+                map.removeLayer(mask);
+                this._instance.notifyChange(map);
+            });
+        }
+        this._masks.delete(dataset.uuid);
+    }
+
+    private async importFromObject(title: string, geojson: any){
+        let dataset: DatasetOrGroup;
+        const randomHexColor = (): string =>
+            '#' + Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, '0');
+
+        const darken = (hex: string, amt = 40): string => {
+            const num = parseInt(hex.slice(1), 16);
+            const r = Math.max(0, (num >> 16) - amt);
+            const g = Math.max(0, ((num >> 8) & 0xff) - amt);
+            const b = Math.max(0, (num & 0xff) - amt);
+            return '#' + ((r << 16) | (g << 8) | b).toString(16).padStart(6, '0');
+        }
+
+        const randomColor = randomHexColor();
+
+        try {
+            const source: any = new VectorSource({
+                data: { content: geojson, format: new GeoJSON() },
+                dataProjection: "EPSG:4326",
+                style: (feature) => {
+                    // const id = getUid(feature);
+                    const highlight = feature.get("highlight");
+                    const width = highlight ? 12 : 6;
+                    const fillColor = highlight ? "#00000011"  : "#00000001" ;
+                    const color = randomColor;
+
+                    return [
+                        new Style({
+                            zIndex: highlight ? 11 : 0,
+                            stroke: new Stroke({ color: color, width: width }),
+                            fill: new Fill({ color: fillColor }),
+                        }),
+                        new Style({
+                            zIndex: highlight ? 10 : 0,
+                            stroke: new Stroke({ color: darken(color), width: width - 2 }),
+                            fill: new Fill({ color: fillColor }),
+                        }),
+                    ]
+
+                }
+            })
+                    
+            // Reserve promise usage for future (e.g. autodetecting format based on content, etc.)
+            // return Promise.resolve(new Dataset(datasetConfig));
+
+
+            dataset = new Dataset({
+                name: title,
+                visible: true,
+                type: "colorLayer",
+                source: source,
+            })
+            dataset = this._store.add(dataset); // We need to keep track of the reactive dataset!
+
+            this._notifications.push(
+                new Notification(dataset.name, 'Import done, parsing data...', 'success'),
+            );
+
+        } catch (e) {
+            console.error(e);
+            this._notifications.push(new Notification(title, (e as Error).message, 'error'));
+            return;
+        }
+
+        try {
+            dataset.isPreloading = true;
+            await this.preloadDataset(dataset);
+            this._notifications.push(
+                new Notification(dataset.name, 'Import successful.', 'success'),
+            );
+        } catch (_e) {
+            // Already logged, ignore
+        }
+
+        GLOBAL_EVENT_DISPATCHER.dispatchEvent({ type: 'dataset-added', value: dataset });
+
+    }
+
+    private async importFromFile(file: File | string): Promise<void> {
+        let dataset: DatasetOrGroup;
+        const name = file instanceof File ? file.name : file;
+        try {
+            this._notifications.push(new Notification(name, 'Importing file...'));
+            const _dataset = await loader.importFile(file, getConfig());
+            dataset = this._store.add(_dataset); // We need to keep track of the reactive dataset!
+            this._notifications.push(
+                new Notification(dataset.name, 'Import done, parsing data...', 'success'),
+            );
+        } catch (e) {
+            console.error(e);
+            this._notifications.push(new Notification(name, (e as Error).message, 'error'));
+            return;
+        }
+
+        try {
+            dataset.isPreloading = true;
+            await this.preloadDataset(dataset);
+            this._notifications.push(
+                new Notification(dataset.name, 'Import successful.', 'success'),
+            );
+        } catch (_e) {
+            // Already logged, ignore
+        }
+
+        GLOBAL_EVENT_DISPATCHER.dispatchEvent({ type: 'dataset-added', value: dataset });
+    }
+
+    private onDatasetPreloaded(dataset: DatasetOrGroup, entity: Entity3D): void {
+        dataset.isPreloaded = true;
+        dataset.isPreloading = false;
+
+        if (dataset.onObjectPreloaded) {
+            dataset.onObjectPreloaded(dataset, entity);
+        }
+
+        this._store.attachEntity(dataset, entity);
+    }
+
+    private onDatasetPreloadedAsLayer(dataset: DatasetOrGroup, layer: DatasetLayer): void {
+        dataset.isPreloaded = true;
+        dataset.isPreloading = false;
+
+        this._store.attachLayer(dataset, layer);
+    }
+
+    private async onToggleGrid(dataset: DatasetOrGroup): Promise<void> {
+        if (this._axisGrids.has(dataset.uuid)) {
+            this.deleteGrid(dataset);
+        } else {
+            await this.createGrid(dataset);
+        }
+    }
+
+    private async onToggleMask(dataset: DatasetOrGroup): Promise<void> {
+        if (this._masks.has(dataset.uuid)) {
+            this.deleteMask(dataset);
+        } else {
+            await this.createMask(dataset);
+        }
+    }
+
+    private async onVisibilityChanged(
+        dataset: DatasetOrGroup,
+        newVisibility: boolean,
+    ): Promise<void> {
+        try {
+            dataset.visible = newVisibility;
+            if (!dataset.isPreloaded && newVisibility) {
+                await this.preloadDataset(dataset);
+            }
+            await this.updateDataset(dataset);
+            if (Datagroup.isGroup(dataset)) {
+                dataset.children.forEach(ds => void this.onVisibilityChanged(ds, newVisibility));
+            }
+        } catch (_e) {
+            dataset.visible = false;
+        }
+
+        GLOBAL_EVENT_DISPATCHER.dispatchEvent({
+            type: 'dataset-visibility-changed',
+            value: dataset,
+        });
+    }
+
+    private async preloadDataset(dataset: DatasetOrGroup): Promise<DatasetOrGroup> {
+        if (dataset.isPreloaded) {
+            return Promise.resolve(dataset);
+        }
+
+        if (Datagroup.isGroup(dataset)) {
+            dataset.isPreloaded = true;
+            return Promise.resolve(dataset);
+        }
+
+        dataset.isPreloading = true;
+
+        try {
+            if (datasetSupportsOverlay(dataset)) {
+                const layer = await LayerBuilder.getDatasetLayer(this._instance, dataset);
+
+                layer.visible = dataset.visible;
+                this._overlays.set(dataset.uuid, layer);
+
+                await this._layerManager.addDatasetLayer(layer);
+                this.onDatasetPreloadedAsLayer(dataset, layer);
+            } else if (datasetSupportsMeshes(dataset)) {
+                const entity = await EntityBuilder.getEntity(this._instance, dataset);
+
+                entity.visible = dataset.visible;
+                this._entities.set(dataset.uuid, entity);
+
+                await this._instance.add(entity);
+                this.onDatasetPreloaded(dataset, entity);
+            } else {
+                throw new Error('Dataset is neither an overlay or 3d mesh');
+            }
+        } catch (e) {
+            console.error('Could not load dataset', dataset, e);
+            dataset.isPreloading = false;
+            this._notifications.push(
+                new Notification(
+                    dataset.name,
+                    `Could not load dataset : ${(e as Error).message}`,
+                    'error',
+                ),
+            );
+            throw e;
+        }
+
+        return dataset;
+    }
+
+    private async updateDataset(dataset: DatasetOrGroup): Promise<void> {
+        const entity = this._entities.get(dataset.uuid);
+        if (entity) {
+            entity.visible = dataset.visible;
+            if (
+                dataset.visible &&
+                'isMaskingBasemap' in dataset.config &&
+                dataset.config.isMaskingBasemap === true
+            ) {
+                await this.createMask(dataset);
+            } else if (!dataset.visible && this._masks.has(dataset.uuid)) {
+                this.deleteMask(dataset);
+            }
+            this._instance.notifyChange(entity);
+        }
+
+        const layer = this._overlays.get(dataset.uuid);
+        if (layer) {
+            layer.visible = dataset.visible;
+            this._layerManager.notify(layer);
+        }
+    }
+}

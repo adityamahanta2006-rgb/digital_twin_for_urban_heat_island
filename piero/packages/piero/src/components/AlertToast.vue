@@ -1,0 +1,97 @@
+<script setup lang="ts">
+    import * as bootstrap from 'bootstrap';
+    import { ref } from 'vue';
+
+    import Notification from '@/types/Notification';
+
+    import { useNotificationStore } from '../stores/notifications';
+
+    const alertToast = ref<HTMLDivElement | null>(null);
+    const notification = ref<Notification>(Notification.empty());
+
+    function showNotification(notif: Notification): void {
+        notification.value = notif;
+
+        const toast = bootstrap.Toast.getOrCreateInstance(alertToast.value as HTMLDivElement);
+        toast.show();
+    }
+
+    const notificationStore = useNotificationStore();
+
+    notificationStore.$onAction(({ args, name }) => {
+        switch (name) {
+            case 'push':
+                showNotification(args[0]);
+                break;
+        }
+    });
+
+    function getIcon(): string {
+        if (notification.value == null) {
+            return 'text-bg-success';
+        }
+
+        switch (notification.value.level) {
+            case 'error':
+                return 'bi-exclamation-circle-fill';
+            case 'info':
+                return 'bi-check-circle-fill';
+            case 'success':
+                return 'bi-check-lg';
+            case 'warning':
+                return 'bi-exclamation-triangle-fill';
+            default:
+                return 'text-bg-success';
+        }
+    }
+
+    function getStyle(): string {
+        if (notification.value == null) {
+            return 'text-bg-success';
+        }
+
+        switch (notification.value.level) {
+            case 'error':
+                return 'text-bg-danger';
+            case 'info':
+                return 'text-bg-secondary';
+            case 'success':
+                return 'text-bg-success';
+            case 'warning':
+                return 'text-bg-warning';
+            default:
+                return 'text-bg-success';
+        }
+    }
+
+    // For testing purposes
+    // onMounted(() => {
+    //   showNotification(new Notification('Test', 'this is a test', 'info'));
+    // })
+</script>
+
+<template>
+    <div class="toast-container">
+        <div ref="alertToast" class="toast" role="alert" aria-live="assertive" aria-atomic="true">
+            <div :class="['toast-header', getStyle()]">
+                <i :v-if="notification.level === 'info'" :class="['bi', getIcon()]"></i>
+                <strong class="me-auto mx-2">{{ notification.title }}</strong>
+                <!-- <small>11 mins ago</small> -->
+                <button
+                    type="button"
+                    class="btn-close"
+                    data-bs-dismiss="toast"
+                    aria-label="Close"
+                ></button>
+            </div>
+            <div class="toast-body" v-html="notification.text"></div>
+        </div>
+    </div>
+</template>
+
+<style scoped>
+    .toast-container {
+        bottom: 5rem;
+        right: 1rem;
+    }
+</style>

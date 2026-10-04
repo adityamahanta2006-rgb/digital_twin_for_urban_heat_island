@@ -1,0 +1,177 @@
+import type Instance from '@giro3d/giro3d/core/Instance';
+import type { Object3D } from 'three';
+
+import HttpConfiguration from '@giro3d/giro3d/utils/HttpConfiguration';
+import { AmbientLight, Box3, DirectionalLight, EventDispatcher } from 'three';
+
+import AnalysisManager from '@/services/AnalysisManager';
+import AnnotationManager from '@/services/AnnotationManager';
+import CameraController from '@/services/CameraController';
+import DatasetManager from '@/services/DatasetManager';
+import Highlighter from '@/services/Highlighter';
+import LayerManager from '@/services/LayerManager';
+import MeasurementManager from '@/services/MeasurementManager';
+import Picker from '@/services/Picker';
+import { useGiro3dStore } from '@/stores/giro3d';
+import Fetcher from '@/utils/Fetcher';
+
+if (import.meta.env.VITE_HEADERS) {
+    for (const [host, header] of Object.entries(import.meta.env.VITE_HEADERS)) {
+        if (!Fetcher.checkAbsoluteHost(host)) {
+            console.warn(`Invalid host in VITE_HEADERS: ${host}`);
+            continue;
+        }
+
+        for (const [name, value] of Object.entries(header)) {
+            HttpConfiguration.setHeader(host, name, value);
+        }
+    }
+}
+
+if (
+    import.meta.env.VITE_AUTHORIZATION_DOMAIN != null &&
+    import.meta.env.VITE_AUTHORIZATION_VALUE != null
+) {
+    if (!Fetcher.checkAbsoluteHost(import.meta.env.VITE_AUTHORIZATION_DOMAIN)) {
+        console.warn(
+            `Invalid host in VITE_AUTHORIZATION_DOMAIN: ${import.meta.env.VITE_AUTHORIZATION_DOMAIN}`,
+        );
+    } else {
+        HttpConfiguration.setAuth(
+            import.meta.env.VITE_AUTHORIZATION_DOMAIN,
+            import.meta.env.VITE_AUTHORIZATION_VALUE,
+        );
+    }
+}
+
+if (import.meta.env.VITE_AUTHORIZATIONS) {
+    for (const [host, value] of Object.entries(import.meta.env.VITE_AUTHORIZATIONS)) {
+        if (!Fetcher.checkAbsoluteHost(host)) {
+            console.warn(`Invalid host in VITE_AUTHORIZATIONS: ${host}`);
+            continue;
+        }
+        HttpConfiguration.setAuth(host, value);
+    }
+}
+
+type Giro3DManagerEventMap = {
+    update: {
+        /** empty */
+    };
+};
+
+export default class Giro3DManager extends EventDispatcher<Giro3DManagerEventMap> {
+    public readonly ambientLight: AmbientLight;
+
+    public readonly analysisManager: AnalysisManager;
+    public readonly annotationManager: AnnotationManager;
+    public readonly camera: CameraController;
+    public readonly datasetManager: DatasetManager;
+    public readonly dirLight: DirectionalLight;
+    public readonly highlighter: Highlighter;
+    public readonly layerManager: LayerManager;
+    public readonly mainInstance: Instance;
+    public readonly measurementManager: MeasurementManager;
+    public readonly picker: Picker;
+    private readonly _boundOnFrameEnd: () => void;
+
+    private readonly _store = useGiro3dStore();
+
+    public constructor(instance: Instance) {
+        super();
+
+        this.mainInstance = instance;
+
+        this.picker = new Picker();
+        this.camera = new CameraController(this.mainInstance, this.picker);
+
+        const position = this._store.getDefaultCameraPosition();
+        const lookAt = this._store.getDefaultCameraLookAt();
+        void this.camera.lookAt(position.toVector3(), lookAt.toVector3());
+
+        this.layerManager = new LayerManager(this.mainInstance);
+        this.datasetManager = new DatasetManager(this.mainInstance, this.layerManager);
+        this.annotationManager = new AnnotationManager(this.mainInstance, this.camera, this.picker);
+        this.analysisManager = new AnalysisManager(this.mainInstance, this.layerManager);
+        this.highlighter = new Highlighter();
+        this.picker = new Picker();
+        this.measurementManager = new MeasurementManager(
+            this.mainInstance,
+            this.camera,
+            this.picker,
+        );
+
+        this._boundOnFrameEnd = this.onFrameEnd.bind(this);
+        this.mainInstance.addEventListener('update-end', this._boundOnFrameEnd);
+
+        this.mainInstance.renderingOptions.enableEDL = true;
+        this.mainInstance.renderingOptions.enableInpainting = false;
+        this.mainInstance.renderingOptions.enablePointCloudOcclusion = false;
+
+        const lightColor = 0xffffff;
+
+        this.ambientLight = new AmbientLight(lightColor, 0.6);
+        this.mainInstance.scene.add(this.ambientLight);
+
+        this.dirLight = new DirectionalLight(lightColor, 2);
+        this.dirLight.position.set(lookAt.x - 10000, lookAt.y - 10000, 10000);
+        this.dirLight.target.position.set(lookAt.x, lookAt.y, 0);
+        this.mainInstance.scene.add(this.dirLight);
+        this.mainInstance.scene.add(this.dirLight.target);
+        this.dirLight.updateMatrixWorld();
+        this.mainInstance.scene.updateMatrixWorld();
+
+        // We disable the skybox for now as it breaks the rendering of point cloud  with effects.
+        // Skybox.addSkybox(this.mainInstance);
+
+        this.mainInstance.notifyChange();
+    }
+
+    public dispose(): void {
+        this.mainInstance.removeEventListener('update-end', this._boundOnFrameEnd);
+        this.mainInstance.scene.remove(this.dirLight.target);
+        this.mainInstance.scene.remove(this.dirLight);
+        this.mainInstance.scene.remove(this.ambientLight);
+        this.measurementManager.dispose();
+        this.highlighter.dispose();
+        this.analysisManager.dispose();
+        this.annotationManager.dispose();
+        this.layerManager.dispose();
+        this.camera.dispose();
+    }
+
+    /**
+     * Gets bounding box of all datasets & annotations.
+     *
+     * @returns Bounding box of all datasets.
+     */
+    public getBoundingBox(): Box3 {
+        const bbox = new Box3();
+        const bbox2 = new Box3();
+        this.mainInstance.scene.traverse(obj => {
+            bbox2.setFromObject(obj);
+            bbox.union(bbox2);
+        });
+        return bbox;
+    }
+
+    /**
+     * Gets the datasets & annotations as Object3D.
+     */
+    public getObjects3d(): Object3D[] {
+        const result: Object3D[] = [];
+        this.mainInstance.scene.traverse(o => {
+            result.push(o);
+        });
+        return result;
+    }
+
+    private onFrameEnd(): void {
+        // Temporary solution to avoid annoying horizontal line artifacts
+        // on point cloud due to constantly shifting near clipping plane.
+        const camera = this.mainInstance.view.camera;
+        camera.near = 2;
+
+        this.dispatchEvent({ type: 'update' });
+    }
+}

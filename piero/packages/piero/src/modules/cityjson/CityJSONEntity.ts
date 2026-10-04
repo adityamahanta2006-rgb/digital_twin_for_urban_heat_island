@@ -1,0 +1,271 @@
+import type PickableFeatures from '@giro3d/giro3d/core/picking/PickableFeatures';
+import type PickOptions from '@giro3d/giro3d/core/picking/PickOptions';
+import type PickResult from '@giro3d/giro3d/core/picking/PickResult';
+import type { Material, Vector2 } from 'three';
+
+import Coordinates from '@giro3d/giro3d/core/geographic/Coordinates';
+import Entity3D from '@giro3d/giro3d/entities/Entity3D';
+import {
+    CityJSONLoader as CityJSONThreeLoader,
+    CityJSONWorkerParser,
+    type CityObjectsMaterial,
+    type CityObjectsMesh,
+} from 'cityjson-threejs-loader';
+import { DoubleSide, FrontSide, Group } from 'three';
+
+import type {
+    DataProjectionMixin,
+    FeatureProjectionMixin,
+    UrlOrDataMixin,
+} from '@/giro3d/sources/mixins';
+
+import { fillObject3DUserData } from '@/loaders/userData';
+import Fetcher from '@/utils/Fetcher';
+import Projections from '@/utils/Projections';
+import { isObject } from '@/utils/Types';
+
+/**
+ * Feature returned when picking on CityJSON objects
+ */
+export interface CityJSONFeature {
+    /** Intersection info from CityJSON library */
+    cityjsonInfo: CityJSONIntersectionInfo;
+    /** CityJSON object picked */
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    citymodel: any;
+}
+
+/**
+ * Object returned by CityJSON's `resolveIntersectionInfo`, used when picking
+ */
+export interface CityJSONIntersectionInfo {
+    boundaryIndex: number;
+    geometryIndex: number;
+    lodIndex: number;
+    objectId: string;
+    objectIndex: number;
+    objectTypeIndex: number;
+    surfaceTypeIndex: number;
+    vertexId: number;
+}
+
+/**
+ * Pick result on {@link CityJSONEntity | CityJSON entities}
+ */
+export interface CityJSONPickResult extends PickResult<CityJSONFeature> {
+    entity: CityJSONEntity;
+    features?: CityJSONFeature[];
+    isCityJSONPickResult: true;
+    object: CityObjectsMesh;
+}
+export const isCityJSONPickResult = (obj: unknown): obj is CityJSONPickResult =>
+    isObject(obj) && (obj as CityJSONPickResult).isCityJSONPickResult;
+
+/**
+ * Source interface for {@link CityJSONEntity}
+ */
+export interface CityJSONSource
+    extends DataProjectionMixin,
+        Required<FeatureProjectionMixin>,
+        UrlOrDataMixin {}
+
+/**
+ * Entity for displaying a CityJSON file
+ */
+export default class CityJSONEntity
+    extends Entity3D
+    implements PickableFeatures<CityJSONFeature, CityJSONPickResult>
+{
+    public readonly isCityJSONEntity = true;
+    public readonly isPickableFeatures = true;
+    public readonly source: CityJSONSource;
+
+    public override readonly type = 'CityJSONEntity';
+    /** Array of the available Levels Of Details in this CityJSON model */
+    public get availableLods(): string[] | null {
+        return this._availableLods ? [...this._availableLods] : null;
+    }
+    /**
+     * Gets the displayed index of Level Of Details, from {@link availableLods}.
+     * If `-1` or out of bounds, displays all levels.
+     */
+    public get displayedLodIdx(): number {
+        return this._displayedLodIdx;
+    }
+    /**
+     * Sets the displayed index of Level Of Details, from {@link availableLods}.
+     * If `-1` or out of bounds, displays all levels.
+     * @param lodIdx - Index from {@link availableLods}
+     */
+    public set displayedLodIdx(lodIdx: number) {
+        this._displayedLodIdx = lodIdx;
+        this.traverseCityMaterials(m => (m.showLod = lodIdx));
+        this.notifyChange(this.object3d);
+    }
+
+    /** Gets whether the theme uses semantics or not */
+    public get showSemantics(): boolean {
+        return this._showSemantics;
+    }
+
+    /** Sets whether the theme uses semantics or not */
+    public set showSemantics(v: boolean) {
+        this._showSemantics = v;
+        this.traverseCityMaterials(m => (m.showSemantics = v));
+        this.notifyChange(this.object3d);
+    }
+    private _availableLods: string[] | null;
+    private _displayedLodIdx: number;
+
+    private _showSemantics: boolean;
+    public constructor(source: CityJSONSource) {
+        super(new Group());
+        this.source = source;
+        this._availableLods = null;
+        this._displayedLodIdx = -1;
+        this._showSemantics = true;
+
+        this.addEventListener('clippingPlanes-property-changed', () => {
+            const isClipped =
+                (this.clippingPlanes != null && this.clippingPlanes.length > 0) ||
+                (this.instance?.renderer?.clippingPlanes != null &&
+                    this.instance.renderer.clippingPlanes.length > 0);
+            this.traverseCityMaterials(m => {
+                m.clipping = isClipped;
+                m.side = isClipped ? DoubleSide : FrontSide;
+            });
+        });
+    }
+
+    public static isCityJSONEntity = (obj: object): obj is CityJSONEntity =>
+        isObject(obj) && (obj as CityJSONEntity).isCityJSONEntity;
+
+    public override pick(canvasCoords: Vector2, options?: PickOptions): CityJSONPickResult[] {
+        return super.pick(canvasCoords, options).map(p => ({
+            ...p,
+            entity: this,
+            features: p.features as CityJSONFeature[] | undefined,
+            isCityJSONPickResult: true,
+            object: p.object as CityObjectsMesh,
+        }));
+    }
+
+    public pickFeaturesFrom(pickedResult: CityJSONPickResult): CityJSONFeature[] {
+        const { object } = pickedResult;
+        const cityjsonInfo = object.resolveIntersectionInfo(
+            pickedResult,
+        ) as CityJSONIntersectionInfo;
+        // @ts-expect-error - CityObjectsMesh / cityjsonInfo don't have proper typing
+        const citymodel = object.citymodel.CityObjects[cityjsonInfo.objectId];
+        const result = [{ cityjsonInfo, citymodel }];
+        pickedResult.features = result;
+        return result;
+    }
+
+    public override async preprocess(): Promise<void> {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const json: any = await Fetcher.fetchJson(this.source.url);
+
+        return new Promise<void>((resolve, reject) => {
+            const parser = new CityJSONWorkerParser();
+            const loader = new CityJSONThreeLoader(parser);
+
+            parser.chunkSize = 2000;
+            parser.onComplete = (): void => {
+                // FIXME: here's a code smell indicating we are not using CityJSON correctly
+                let z = 0;
+                if (
+                    json.transform?.translate?.at(2) != null &&
+                    json.transform?.translate.at(2) !== 0
+                ) {
+                    // Z already taken into account when creating mesh
+                    z = 0;
+                } else if (json.vertices?.at(0)?.at(2) !== 0) {
+                    // Z already taken into account in the vertices
+                    z = 0;
+                } else if (json.metadata?.geographicalExtent?.at(5) != null) {
+                    // We have to take Z into account - FIXME
+                    z =
+                        json.metadata?.geographicalExtent[5] -
+                        json.CityObjects?.['1']?.attributes?.[
+                            'ArrDissolve-LoD12.global_elevation_max'
+                        ]
+                            ? json.CityObjects?.['1']?.attributes?.[
+                                  'ArrDissolve-LoD12.global_elevation_max'
+                              ]
+                            : 0;
+                }
+
+                const m = loader.matrix.toArray();
+                const translate = json.transform?.translate ?? [-m[12], -m[13], z];
+                const projection =
+                    json?.metadata?.referenceSystem ??
+                    this.source.dataProjection ??
+                    this.source.featureProjection;
+
+                Projections.loadProjCrsIfNeeded(projection)
+                    .then(proj => {
+                        if (proj) {
+                            const coords = new Coordinates(
+                                proj,
+                                translate[0],
+                                translate[1],
+                                translate[2],
+                            );
+                            const coordsReference = coords.as(this.source.featureProjection);
+                            loader.scene.position.set(
+                                coordsReference.values[0],
+                                coordsReference.values[1],
+                                coordsReference.values[2],
+                            );
+                        } else {
+                            loader.scene.position.set(translate[0], translate[1], translate[2]);
+                        }
+                        loader.scene.updateMatrix();
+                        loader.scene.updateMatrixWorld(true);
+
+                        this.object3d.add(loader.scene);
+
+                        this._availableLods = parser.lods;
+
+                        // Find the "best" LoD
+                        if (this._availableLods != null && this._availableLods.length > 0) {
+                            const sortedAvailableLods = Array.from(this._availableLods);
+                            sortedAvailableLods.sort();
+                            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+                            const bestLod = sortedAvailableLods.pop()!;
+                            this._displayedLodIdx = this._availableLods.indexOf(bestLod);
+                        } else {
+                            this._displayedLodIdx = -1;
+                        }
+
+                        this.traverseCityMaterials(m => {
+                            m.showLod = this._displayedLodIdx;
+                        });
+
+                        this.onObjectCreated(loader.scene);
+
+                        const context = Fetcher.getContext(this.source.url);
+                        fillObject3DUserData(this, { filename: context.filename });
+
+                        this.notifyChange(this.object3d);
+                        resolve();
+                    })
+                    .catch(e => reject(e as Error));
+            };
+
+            loader.load(json);
+        });
+    }
+
+    private traverseCityMaterials(callback: (m: CityObjectsMaterial) => void): void {
+        this.object3d.traverse(obj => {
+            if ('material' in obj && obj.material != null) {
+                const m = obj.material as Material;
+                if ('isCityObjectsMaterial' in m && m.isCityObjectsMaterial === true) {
+                    callback(m as unknown as CityObjectsMaterial);
+                }
+            }
+        });
+    }
+}
